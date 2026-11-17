@@ -63,14 +63,57 @@ INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
 LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
-# Standard normal quantiles, house-baseline fallback only.
-Z = (-1.6448536269514722, -0.6744897501960817, 0.0,
-     0.6744897501960817, 1.6448536269514722)
 BASE_SPREAD = 0.15   # house baseline: log-spread grows as 0.15 * sqrt(h-1)
 MIN_VIEWERS = 1.0
 MAX_VIEWERS = 1_000_000_000.0
 MIN_TRAIN = 8        # comparables needed before a per-hour fit is trusted
 MIN_HOURS = 12       # usable hours needed before a launch counts at all
+
+
+def norm_ppf(p):
+    """Inverse standard-normal CDF: Acklam's approximation plus one
+    Newton refinement step (erf-based), accurate to ~1e-10.
+
+    The house-style fallback must honour whatever quantile levels the case
+    asks for, not just the default five -- so it needs a real ppf instead
+    of a hard-coded table of five z-values.  (Acklam alone is only ~3e-5
+    accurate near p=0.05/0.95; the refinement step fixes that.)
+    """
+    if p <= 0.0:
+        return -8.0
+    if p >= 1.0:
+        return 8.0
+    a = (-3.969683028665376e+01, 2.209460984245205e+02,
+         -2.759285984469534e+02, 1.383577518672690e+02,
+         -3.066479806614716e+01, 2.506628277459239e+00)
+    b = (-5.447609879822406e+01, 1.615858368580409e+02,
+         -1.556989798598866e+02, 6.680131188771972e+01,
+         -1.328068155288572e+01)
+    c = (-7.784894002430293e-03, -3.223964580411365e-01,
+         -2.400758277161838e+00, -2.549732539343734e+00,
+         4.374664141464968e+00, 2.938163982698783e+00)
+    d = (7.784695709041462e-03, 3.224671290700398e-01,
+         2.445134137142996e+00, 3.754408661907416e+00)
+    plow = 0.02425
+    phigh = 1.0 - plow
+    if p < plow:
+        q = math.sqrt(-2.0 * math.log(p))
+        x = (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+            ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    elif p > phigh:
+        q = math.sqrt(-2.0 * math.log(1.0 - p))
+        x = -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+             ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+    else:
+        q = p - 0.5
+        r = q * q
+        x = (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / \
+            (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
+    # One Newton step on the CDF: Acklam alone errs by ~3e-5 near the
+    # 5%/95% levels; a single refinement lands within ~1e-10.
+    pdf = math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+    cdf = 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+    return x - (cdf - p) / pdf
 
 
 def clamp(x, lo, hi):
@@ -107,10 +150,14 @@ def ols_intercept_slope(xs, ys):
     return my - b * mx, b
 
 
-def flat_forecast(p1, hour):
-    """House-style fallback: every hour stays at hour 1, spread widens."""
+def flat_forecast(p1, hour, levels):
+    """House-style fallback: every hour stays at hour 1, spread widens.
+
+    Returns one quantile per requested level, so a case that asks for
+    levels other than the default five still gets a well-formed row.
+    """
     spread = BASE_SPREAD * math.sqrt(hour - 1)
-    return [p1 * math.exp(z * spread) for z in Z]
+    return [p1 * math.exp(norm_ppf(tau) * spread) for tau in levels]
 
 
 def comparable_curves(case):
@@ -198,7 +245,7 @@ def forecast_case(case):
             resid = sorted(y - (a + b * x) for x, y in zip(xs, ys))
             qs = [p1 * math.exp(mu + quantile(resid, tau)) for tau in levels]
         else:
-            qs = flat_forecast(p1, h)
+            qs = flat_forecast(p1, h, levels)
         # Keep the row valid: finite, inside (0, 1e9], non-decreasing.
         clean = []
         prev = 0.0
@@ -231,7 +278,7 @@ def main():
             out = None
         if out is None:
             # Last-resort valid output: flat at 1 viewer, widening spread.
-            out = {"hours": [{"hour": h, "q": flat_forecast(1.0, h)}
+            out = {"hours": [{"hour": h, "q": flat_forecast(1.0, h, list(LEVELS))}
                              for h in range(2, 25)]}
         text = json.dumps(out, separators=(",", ":")) + "\n"
         with open(os.path.join(OUTPUT_DIR, case_id + ".out"),
